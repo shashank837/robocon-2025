@@ -36,7 +36,7 @@ R1 runs ROS Noetic on a Raspberry Pi 4. All the high-level logic (field-centric 
   │  [PS4 Controller]                                                   │
   │       │ Bluetooth → joy node → /joy                                 │
   │       ▼                                                             │
-  │  [joystick_bridge.py] ──► /ps4_data (Twist: vx, vy, heading_target)│
+  │  [joystick_bridge.py] ──► /ps4_data (Twist: vx, vy, heading_target) │
   │                                   │                                 │
   │  [imu_pipeline.py]                │                                 │
   │   BNO055 over I2C                 │                                 │
@@ -52,22 +52,22 @@ R1 runs ROS Noetic on a Raspberry Pi 4. All the high-level logic (field-centric 
   │                                         │                           │
   │  [encoder_bridge.py]                    ▼                           │
   │   USART ← ESP32               [motor_driver.py]                     │
-  │   /encoder_distance ──────►    ├─ pigpio PWM × 4  (drive motors)   │
+  │   /encoder_distance ──────►    ├─ pigpio PWM × 4  (drive motors)    │
   │   (feeds odometry back         ├─ pneumatic dribbler valves (GPIO)  │
   │    into motion_controller)     └─ BLDC shooter relay (GPIO)         │
   │                                         │ pigpio / GPIO             │
-  └─────────────────────────────────────────┼─────────────────────────-─┘
+  └─────────────────────────────────────────┼───────────────────────────┘
                                             │
            ┌────────────────────────────────┘
            │
   ┌──────────────────────────────────────────────────────────┐
   │  ESP32  (FreeRTOS)                                       │
   │                                                          │
-  │  Core 0 — Task_EncoderRead  @ 100 Hz                    │
-  │   Reads 3 quadrature encoders (Xu, Xd, Y)               │
+  │  Core 0 — Task_EncoderRead  @ 100 Hz                     │
+  │   Reads 3 quadrature encoders (Xu, Xd, Y)                │
   │   Heading from differential X encoders                   │
   │   Integrates world-frame X, Y position                   │
-  │   Streams odometry → RPi over USART (EasyTransfer)      │
+  │   Streams odometry → RPi over USART (EasyTransfer)       │
   └──────────────────────────────────────────────────────────┘
 ```
 
@@ -77,15 +77,15 @@ R2 runs entirely on an Arduino Due — no OS, no ROS. An ESP32 handles PS4 Bluet
 
 ```
   ┌───────────────────┐                    ┌────────────────────────────────────┐
-  │      ESP32        │                    │            Arduino Due              │
+  │      ESP32        │                    │            Arduino Due             │
   │                   │  USART             │                                    │
   │  PS4 Bluetooth    │  EasyTransfer      │  3-wheel omni inverse kinematics   │
   │  receiver         │ ─────────────────► │  Active heading lock (P control)   │
-  │                   │                    │  Encoder-gated net deployment       │
-  │                   │  struct {          │  Pneumatic valve driver             │
+  │                   │                    │  Encoder-gated net deployment      │
+  │                   │  struct {          │  Pneumatic valve driver            │
   │                   │   x, y,            │                                    │
   │                   │   buttons,         │  Motor PWM × 3  +  DIR × 3         │
-  │                   │   angle }          │  Net motor PWM  +  encoder          │
+  │                   │   angle }          │  Net motor PWM  +  encoder         │
   └───────────────────┘                    └────────────────────────────────────┘
 ```
 
