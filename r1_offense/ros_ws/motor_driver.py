@@ -49,11 +49,12 @@ from sensor_msgs.msg import Joy
 # GPIO pin assignments (BCM numbering)
 # ---------------------------------------------------------------------------
 
-# Drive motors: (PWM pin, direction pin)
+# Drive motors: (PWM pin, direction pin) — 4-wheel omni layout
 MOTOR_PINS = [
-    {"pwm": 21, "dir": 20},   # Motor 1
-    {"pwm": 16, "dir": 12},   # Motor 2
-    {"pwm": 13, "dir":  6},   # Motor 3
+    {"pwm": 21, "dir": 20},   # Motor 1 — front-left
+    {"pwm": 16, "dir": 12},   # Motor 2 — front-right
+    {"pwm": 13, "dir":  6},   # Motor 3 — rear-left
+    {"pwm": 19, "dir": 26},   # Motor 4 — rear-right
 ]
 
 # Pneumatic dribbler
@@ -116,8 +117,8 @@ def _motor_value_callback(msg):
     Receive signed wheel speeds from motion_controller.py and
     drive each motor accordingly.
     """
-    if len(msg.data) != 3:
-        rospy.logwarn(f"motor_driver: expected 3 wheel speeds, got {len(msg.data)}")
+    if len(msg.data) != 4:
+        rospy.logwarn(f"motor_driver: expected 4 wheel speeds, got {len(msg.data)}")
         return
 
     for motor, speed in zip(MOTOR_PINS, msg.data):

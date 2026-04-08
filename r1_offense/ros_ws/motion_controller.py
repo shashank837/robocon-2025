@@ -28,10 +28,10 @@ Active Heading Lock (shared autonomy):
     This eliminates rotational drift without requiring the driver to
     actively steer.
 
-3-wheel omni inverse kinematics:
-    Body-frame (vx, vy, omega) is decomposed analytically into three
-    individual wheel speeds. Speeds are clipped to the PWM range by the
-    downstream motor_driver node.
+4-wheel omni inverse kinematics:
+    Body-frame (vx, vy, omega) is decomposed analytically into four
+    individual wheel speeds using the standard 45°-wheel omni model.
+    Speeds are clipped to the PWM range by the downstream motor_driver node.
 """
 
 import rospy
@@ -98,21 +98,30 @@ def _rotate_to_robot_frame(vx_world, vy_world, yaw_deg):
     return vx_body, vy_body
 
 
-def _omni3_inverse_kinematics(vx, vy, omega):
+def _omni4_inverse_kinematics(vx, vy, omega):
     """
-    3-wheel symmetric omni-drive inverse kinematics.
+    4-wheel omni-drive inverse kinematics.
 
-    Wheel layout (angles from robot front):
-        Motor 1: 90°  (left)
-        Motor 2: 210° (right-rear)
-        Motor 3: 330° (left-rear)
+    Wheels are mounted at 45° to the chassis sides (standard omni layout):
+        Motor 1: front-left
+        Motor 2: front-right
+        Motor 3: rear-left
+        Motor 4: rear-right
 
-    Returns raw (unscaled) speed for each wheel. The sign encodes direction.
+    The factor 1/(2√2) ≈ 0.3536 comes from projecting each wheel's
+    rolling direction (45° to the body axes) onto vx and vy.
+    L_R is the ratio of robot half-diagonal to wheel radius (0.09 / 0.075).
+
+    Returns raw (unscaled) speed for each wheel. Sign encodes direction.
     """
-    w1 = (-vx / 3.0)        + (vy / math.sqrt(3)) + (omega / 3.0)
-    w2 = (-vx / 3.0)        - (vy / math.sqrt(3)) + (omega / 3.0)
-    w3 = ( 2.0 * vx / 3.0)                         + (omega / 3.0)
-    return [w1, w2, w3]
+    K    = 0.3536       # 1 / (2 * sqrt(2))
+    L_R  = 0.09 / 0.075  # robot geometry: half-diagonal / wheel radius = 1.2
+
+    w1 = K * (-vx + vy) + L_R * omega   # front-left
+    w2 = K * (-vx - vy) + L_R * omega   # front-right
+    w3 = K * ( vx - vy) + L_R * omega   # rear-left
+    w4 = K * ( vx + vy) + L_R * omega   # rear-right
+    return [w1, w2, w3, w4]
 
 
 # ---------------------------------------------------------------------------
@@ -229,8 +238,8 @@ def _control_loop():
         # --- Field-centric velocity transform ---
         vx_body, vy_body = _rotate_to_robot_frame(_vx_user, _vy_user, _current_yaw)
 
-        # --- 3-wheel inverse kinematics ---
-        wheel_speeds = _omni3_inverse_kinematics(vx_body, vy_body, omega)
+        # --- 4-wheel inverse kinematics ---
+        wheel_speeds = _omni4_inverse_kinematics(vx_body, vy_body, omega)
 
         # Publish as integer PWM values (clipping happens in motor_driver.py)
         msg      = Int32MultiArray()

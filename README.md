@@ -17,7 +17,7 @@ Two robots were designed with distinct roles and distinct engineering approaches
 | | **R1 — Offense** | **R2 — Defense** |
 |---|---|---|
 | **Role** | Shooter + Dribbler | Rapid-response defender |
-| **Drive** | 3-wheel omni | 3-wheel omni |
+| **Drive** | 4-wheel omni | 3-wheel omni |
 | **Brain** | Raspberry Pi 4 (ROS Noetic) | Arduino Due (bare-metal) |
 | **Comms** | ROS topics → ESP32 → Due (USART) | ESP32 → Due (USART) |
 | **Special** | BLDC shooter, pneumatic dribbler | Encoder-controlled sliding net |
@@ -93,16 +93,32 @@ The ESP32 on R1 runs two **FreeRTOS tasks pinned to separate cores**:
 - **Core 0**: 100 Hz quadrature encoder sampling from 3 encoders. Computes heading from differential X-encoders, integrates world-frame position, and streams odometry over USART.
 - **Core 1**: Async WebSocket server for real-time pneumatic slider control via a phone/tablet UI.
 
-### 4. 3-Wheel Omni Inverse Kinematics
-Both robots use a symmetric 3-wheel omni configuration. Wheel speeds are derived analytically from desired body-frame velocity `(vx, vy, ω)`:
+### 4. Omni-Drive Inverse Kinematics (distinct per robot)
+
+**R1 — 4-Wheel Omni IK**
+
+Wheels are mounted at 45° to the chassis sides. Given body-frame `(vx, vy, ω)`:
 
 ```
-ω₁ = (−vx / 3) + (vy / √3) + (ω / 3)
-ω₂ = (−vx / 3) − (vy / √3) + (ω / 3)
-ω₃ = ( 2vx / 3)              + (ω / 3)
+ω₁ =  (1/2√2)(−vx + vy) + (L/R)·ω    # front-left
+ω₂ =  (1/2√2)(−vx − vy) + (L/R)·ω    # front-right
+ω₃ =  (1/2√2)( vx − vy) + (L/R)·ω    # rear-left
+ω₄ =  (1/2√2)( vx + vy) + (L/R)·ω    # rear-right
 ```
 
-Speeds are proportionally scaled to fit the 0–255 PWM range while preserving direction ratios.
+where L/R = robot half-diagonal / wheel radius = 0.09 / 0.075 = 1.2
+
+**R2 — 3-Wheel Omni IK**
+
+Symmetric 120° wheel layout. Given body-frame `(vx, vy, ω)`:
+
+```
+ω₁ = (−2vx / 3)                + (ω / 3)    # front
+ω₂ = (  vx / 3) + (vy / √3)   + (ω / 3)    # rear-right
+ω₃ = (  vx / 3) − (vy / √3)   + (ω / 3)    # rear-left
+```
+
+In both cases, speeds are proportionally scaled to the PWM range while preserving the velocity direction ratio.
 
 ### 5. Multi-Actuator Upper Control (R1)
 A single ESP32 manages three independent actuators on R1's upper mechanism:
@@ -151,7 +167,7 @@ robocon-2025/
 | Odometry MCU | ESP32 DevKit | USART to Due, WiFi WebSocket |
 | Motor MCU | Arduino Due | USART from Pi, PWM to drivers |
 | IMU | BNO055 | I2C to RPi |
-| Drive motors | 3× Brushed DC + encoders | pigpio PWM |
+| Drive motors | 4× Brushed DC + encoders (omni) | pigpio PWM |
 | Shooter | BLDC motor + ESC | PWM (50 Hz, 1000–2000 µs) |
 | Shooter angle | Stepper + quadrature encoder | STEP/DIR pulses |
 | Dribbler | Pneumatic cylinder × 2 (4 valves) | GPIO |
