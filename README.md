@@ -27,7 +27,7 @@ We built two robots with completely different roles, which ended up using pretty
 
 ### R1 — Offense Robot
 
-R1 runs ROS Noetic on a Raspberry Pi 4. All the high-level logic (field-centric drive, heading lock PID, inverse kinematics) lives in Python ROS nodes. The Pi talks to an ESP32 over USART, which handles encoder odometry and also runs a WebSocket server for controlling the dribbler slider from a phone.
+R1 runs ROS Noetic on a Raspberry Pi 4. All the high-level logic (field-centric drive, heading lock PID, inverse kinematics) lives in Python ROS nodes. The Pi talks to an ESP32 over USART, which handles encoder odometry and streams position data back.
 
 ```
   ┌─────────────────────────────────────────────────────────────────────┐
@@ -60,20 +60,15 @@ R1 runs ROS Noetic on a Raspberry Pi 4. All the high-level logic (field-centric 
                                             │
            ┌────────────────────────────────┘
            │
-  ┌────────▼─────────────────────────────────────────┐
-  │  ESP32  (FreeRTOS — two cores)                   │
-  │                                                  │
-  │  Core 0 — Task_EncoderRead  @ 100 Hz             │
-  │   Reads 3 quadrature encoders (Xu, Xd, Y)        │
-  │   Heading from differential X encoders            │
-  │   Integrates world-frame X, Y position            │
-  │   Streams odometry → RPi over USART (EasyTransfer)│
-  │                                                  │
-  │  Core 1 — Task_WebSocket                         │
-  │   AsyncWebServer over WiFi                       │
-  │   Receives JSON slider value from phone/tablet   │
-  │   Updates dribbler height setpoint               │
-  └──────────────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────────────┐
+  │  ESP32  (FreeRTOS)                                       │
+  │                                                          │
+  │  Core 0 — Task_EncoderRead  @ 100 Hz                    │
+  │   Reads 3 quadrature encoders (Xu, Xd, Y)               │
+  │   Heading from differential X encoders                   │
+  │   Integrates world-frame X, Y position                   │
+  │   Streams odometry → RPi over USART (EasyTransfer)      │
+  └──────────────────────────────────────────────────────────┘
 ```
 
 ### R2 — Defense Robot
@@ -150,15 +145,11 @@ L_R  = robot_half_diagonal / wheel_radius = 0.09 / 0.075 = 1.2
 
 In both cases the outputs are proportionally scaled so the fastest wheel hits PWM 255 and the others scale down, keeping the velocity direction ratio intact.
 
-### FreeRTOS Dual-Core Odometry (R1 ESP32)
+### FreeRTOS Encoder Odometry (R1 ESP32)
 
-The ESP32 on R1 does two things simultaneously using FreeRTOS tasks pinned to separate cores:
+The ESP32 on R1 runs a FreeRTOS task pinned to Core 0 that reads three quadrature encoders at 100 Hz. It uses the tick difference between the upper and lower X-axis encoders to estimate heading (`Δangle = (ΔxD − ΔxU) × dist_per_pulse / (2 × enc_radius)`), then integrates world-frame X/Y position. The result is streamed to the RPi over USART via EasyTransfer.
 
-- **Core 0** — `Task_EncoderRead` at 100 Hz: reads three quadrature encoders. Uses the tick difference between the upper and lower X-axis encoders to estimate heading (`Δangle = (ΔxD − ΔxU) × dist_per_pulse / (2 × enc_radius)`), then integrates world-frame X/Y position. Streams the result to the RPi over USART via EasyTransfer.
-
-- **Core 1** — `Task_WebSocket`: runs an async WebSocket server over WiFi. A phone/tablet with a slider UI sends JSON to update the dribbler height setpoint during a match without wasting a controller button.
-
-We used FreeRTOS here because the encoder sampling is timing-critical (missing pulses = wrong odometry) while the WebSocket can be handled whenever. Separate cores means no scheduling contention between them.
+We used FreeRTOS here mainly to keep the encoder sampling on a dedicated core at a fixed rate — missing encoder pulses means wrong odometry, so it can't be blocked by anything else running on the same core.
 
 ### Sliding Net Mechanism (R2)
 
@@ -190,7 +181,7 @@ robocon-2025/
 │   │
 │   └── firmware/
 │       ├── esp32_odometry_rtos/
-│       │   └── esp32_odometry_rtos.ino   # FreeRTOS: encoder odometry (core 0) + WebSocket (core 1)
+│       │   └── esp32_odometry_rtos.ino   # FreeRTOS encoder odometry → USART to RPi
 │       └── upper_control/
 │           └── upper_control.ino         # BLDC ESC + stepper angle control + pneumatic dribbler
 │
@@ -278,7 +269,7 @@ For R2, just flash `due_omni_controller.ino` to the Due. No other setup needed.
 - **Active heading lock** — PID design, IMU signal chain, tuning
 - **Field-centric drive** — IMU yaw coordinate transform
 - **4-wheel and 3-wheel omni inverse kinematics** in both Python (ROS) and C++ (bare-metal)
-- **FreeRTOS ESP32 firmware** — dual-core encoder odometry + WebSocket server
+- **FreeRTOS ESP32 firmware** — encoder odometry on a dedicated core, streamed to RPi over USART
 - **Upper control firmware** — coordinating BLDC, stepper, and pneumatics on one ESP32
 - **USART EasyTransfer communication layer** across all microcontrollers
 - **R2 defense controller** — full bare-metal firmware on Arduino Due including the encoder-gated net mechanism

@@ -1,25 +1,18 @@
 /**
- * esp32_odometry_rtos.ino — R1 Offense: Dual-Core Odometry + WebSocket Server
- * =============================================================================
+ * esp32_odometry_rtos.ino — R1 Offense: Encoder Odometry (FreeRTOS)
+ * ===================================================================
  * Platform : ESP32 DevKit
  * Framework: Arduino + FreeRTOS (built into ESP-IDF)
  *
  * Overview
  * --------
- * This firmware runs two independent FreeRTOS tasks pinned to separate cores:
+ * Runs a FreeRTOS task on Core 0 that reads three quadrature encoders
+ * at 100 Hz, integrates world-frame odometry, and streams the result
+ * to the Raspberry Pi over USART using EasyTransfer.
  *
- *   Core 0 — Task_EncoderRead (100 Hz)
- *       Samples three quadrature encoders (X-upper, X-lower, Y) and
- *       integrates world-frame position. Heading is derived from the
- *       differential between the two X-axis encoders (a passive odometry
- *       wheel arrangement). Position and heading are streamed to the
- *       Arduino Due over USART using the EasyTransfer library.
- *
- *   Core 1 — Task_WebSocket (10 Hz cleanup)
- *       Hosts an async WebSocket server over WiFi. Receives JSON messages
- *       from a phone/tablet slider UI and updates the pneumatic dribbler
- *       position setpoint. This allows the drive team to adjust the
- *       dribbler height mid-match without a dedicated button channel.
+ * We used FreeRTOS to pin the encoder task to a dedicated core so that
+ * nothing else can preempt it — missing encoder pulses causes accumulated
+ * odometry error, so the sampling rate needs to be consistent.
  *
  * Encoder geometry
  * ----------------
@@ -28,73 +21,47 @@
  *   encoderY   Y-axis encoder (perpendicular to X)
  *
  *   Heading is estimated from the differential displacement of XU and XD:
- *       Δangle = (Δxd - Δxu) * dist_per_pulse / (2 * enc_radius)
+ *       Δangle = (ΔxD - ΔxU) * dist_per_pulse / (2 * enc_radius)
  *
- *   World-frame position is obtained by rotating body-frame deltas:
+ *   World-frame position is obtained by rotating the body-frame deltas:
  *       Xa = Xb * cos(angle) - Yb * sin(angle)
  *       Ya = Xb * sin(angle) + Yb * cos(angle)
  *
- * USART output (to Arduino Due via EasyTransfer)
- * -----------------------------------------------
+ * USART output (to Raspberry Pi via EasyTransfer)
+ * ------------------------------------------------
  *   Struct SEND_READING {
  *     double currentDist_x;   // world-frame X, cm
  *     double currentDist_y;   // world-frame Y, cm
  *     double angle;           // heading, radians
- *     double slider;          // dribbler position setpoint (0–100)
  *   }
- *
- * WebSocket input (from phone/tablet UI)
- * ----------------------------------------
- *   JSON: { "position": <float> }
- *   Non-zero values update the dribbler position setpoint.
  */
 
 #include <Arduino.h>
 #include <ESP32Encoder.h>
-#include <WiFi.h>
-#include <AsyncTCP.h>
-#include <ESPAsyncWebServer.h>
-#include <ArduinoJson.h>
 #include "EasyTransfer.h"
-
-// ---------------------------------------------------------------------------
-// WiFi credentials — replace before deployment
-// ---------------------------------------------------------------------------
-const char* WIFI_SSID     = "YOUR_SSID";
-const char* WIFI_PASSWORD = "YOUR_PASSWORD";
 
 // ---------------------------------------------------------------------------
 // Odometry constants
 // ---------------------------------------------------------------------------
-const double WHEEL_CIRCUMFERENCE_CM  = 18.84;   // cm — passive odometry wheel
-const double ENCODER_RADIUS_CM       = 30.3;    // cm — half-distance between XU and XD
-const double PULSES_PER_REVOLUTION   = 10000.0;
-const double DIST_PER_PULSE          = WHEEL_CIRCUMFERENCE_CM / PULSES_PER_REVOLUTION;
+const double WHEEL_CIRCUMFERENCE_CM = 18.84;    // cm — passive odometry wheel
+const double ENCODER_RADIUS_CM      = 30.3;     // cm — half-distance between XU and XD
+const double PULSES_PER_REVOLUTION  = 10000.0;
+const double DIST_PER_PULSE         = WHEEL_CIRCUMFERENCE_CM / PULSES_PER_REVOLUTION;
 
 // ---------------------------------------------------------------------------
-// FreeRTOS task parameters
+// FreeRTOS task config
 // ---------------------------------------------------------------------------
-#define ENCODER_TASK_STACK  4096
-#define WEBSOCKET_TASK_STACK 4096
-#define ENCODER_TASK_PERIOD_MS   10   //  100 Hz
-#define WEBSOCKET_CLEANUP_MS    100   //   10 Hz
+#define ENCODER_TASK_STACK     4096
+#define ENCODER_TASK_PERIOD_MS 10     // 100 Hz
 
 // ---------------------------------------------------------------------------
 // Hardware
 // ---------------------------------------------------------------------------
-ESP32Encoder encoderXU;   // Upper X-axis
-ESP32Encoder encoderXD;   // Lower X-axis
-ESP32Encoder encoderY;    // Y-axis
+ESP32Encoder encoderXU;   // Upper X-axis  — pins 12, 14
+ESP32Encoder encoderXD;   // Lower X-axis  — pins 17, 16
+ESP32Encoder encoderY;    // Y-axis        — pins 19, 18
 
-AsyncWebServer  webServer(80);
-AsyncWebSocket  webSocket("/ws");
-EasyTransfer    ET;
-
-// ---------------------------------------------------------------------------
-// Shared state (written by Task_WebSocket, read by Task_EncoderRead)
-// Use volatile to prevent compiler optimisation across task boundaries.
-// ---------------------------------------------------------------------------
-volatile double g_sliderPosition = 0.0;
+EasyTransfer ET;
 
 // ---------------------------------------------------------------------------
 // USART output struct
@@ -103,12 +70,11 @@ struct SEND_READING {
     double currentDist_x;
     double currentDist_y;
     double angle;
-    double slider;
 };
-SEND_READING odometry = {0.0, 0.0, 0.0, 0.0};
+SEND_READING odometry = {0.0, 0.0, 0.0};
 
 // ---------------------------------------------------------------------------
-// Odometry state (Task_EncoderRead only — no shared-state concern)
+// Odometry state (only accessed by Task_EncoderRead)
 // ---------------------------------------------------------------------------
 double prevTicksXU = 0.0;
 double prevTicksXD = 0.0;
@@ -130,11 +96,11 @@ void Task_EncoderRead(void* pvParameters) {
         // Incremental deltas since last sample
         double deltaXU = ticksXU - prevTicksXU;
         double deltaXD = ticksXD - prevTicksXD;
-        double deltaXb = ticksX  - prevTicksX;    // body-frame X
-        double deltaYb = ticksY  - prevTicksY;    // body-frame Y
+        double deltaXb = ticksX  - prevTicksX;    // body-frame X displacement
+        double deltaYb = ticksY  - prevTicksY;    // body-frame Y displacement
 
         // Heading update from differential X encoders
-        // Positive deltaXD - deltaXU → counter-clockwise rotation
+        // Positive (deltaXD - deltaXU) = counter-clockwise rotation
         odometry.angle += ((deltaXD - deltaXU) * DIST_PER_PULSE) / (2.0 * ENCODER_RADIUS_CM);
 
         // Rotate body-frame displacement into world frame
@@ -143,9 +109,8 @@ void Task_EncoderRead(void* pvParameters) {
 
         odometry.currentDist_x += Xa * DIST_PER_PULSE;
         odometry.currentDist_y += Ya * DIST_PER_PULSE;
-        odometry.slider         = g_sliderPosition;
 
-        // Stream odometry to Arduino Due
+        // Stream to Raspberry Pi
         ET.sendData();
 
         // Advance previous-tick accumulators
@@ -160,63 +125,10 @@ void Task_EncoderRead(void* pvParameters) {
 
 
 // ---------------------------------------------------------------------------
-// Task: Core 1 — WebSocket housekeeping
-// ---------------------------------------------------------------------------
-void Task_WebSocket(void* pvParameters) {
-    for (;;) {
-        webSocket.cleanupClients();
-        vTaskDelay(pdMS_TO_TICKS(WEBSOCKET_CLEANUP_MS));
-    }
-}
-
-
-// ---------------------------------------------------------------------------
-// WebSocket event handler
-// ---------------------------------------------------------------------------
-void onWebSocketEvent(AsyncWebSocket* server,
-                      AsyncWebSocketClient* client,
-                      AwsEventType type,
-                      void* arg,
-                      uint8_t* data,
-                      size_t length)
-{
-    if (type != WS_EVT_DATA) return;
-
-    // Null-terminate the incoming message
-    String msg;
-    for (size_t i = 0; i < length; i++) msg += (char)data[i];
-
-    StaticJsonDocument<256> doc;
-    if (deserializeJson(doc, msg) != DeserializationError::Ok) return;
-
-    if (doc.containsKey("position")) {
-        double newPos = doc["position"].as<double>();
-        if (newPos != 0.0) {
-            g_sliderPosition = newPos;
-        }
-    }
-}
-
-
-// ---------------------------------------------------------------------------
 // setup
 // ---------------------------------------------------------------------------
 void setup() {
     Serial.begin(115200);
-
-    // Connect to WiFi
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    Serial.print("Connecting to WiFi");
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print('.');
-    }
-    Serial.println("\nConnected: " + WiFi.localIP().toString());
-
-    // WebSocket server
-    webSocket.onEvent(onWebSocketEvent);
-    webServer.addHandler(&webSocket);
-    webServer.begin();
 
     // Encoders (full-quadrature = 4× resolution)
     encoderXU.attachFullQuad(12, 14);
@@ -226,17 +138,23 @@ void setup() {
     encoderXD.clearCount();
     encoderY.clearCount();
 
-    // EasyTransfer to Arduino Due
+    // EasyTransfer to Raspberry Pi over hardware USART
     ET.begin(details(odometry), &Serial);
 
-    // Launch FreeRTOS tasks, pinned to separate cores
-    xTaskCreatePinnedToCore(Task_EncoderRead, "EncoderRead",
-                            ENCODER_TASK_STACK,  nullptr, 1, nullptr, 0);
+    // Launch encoder task pinned to Core 0
+    xTaskCreatePinnedToCore(
+        Task_EncoderRead,
+        "EncoderRead",
+        ENCODER_TASK_STACK,
+        nullptr,
+        1,
+        nullptr,
+        0
+    );
 
-    xTaskCreatePinnedToCore(Task_WebSocket,   "WebSocket",
-                            WEBSOCKET_TASK_STACK, nullptr, 1, nullptr, 1);
+    Serial.println("Odometry task started on Core 0");
 }
 
 
-// loop() is intentionally empty — all work is done in FreeRTOS tasks
+// loop() is intentionally empty — all work is in the FreeRTOS task
 void loop() {}
