@@ -1,278 +1,305 @@
 # Robocon 2025 — Robot Basketball
 
-[![ROS](https://img.shields.io/badge/ROS-Noetic-blue)](http://wiki.ros.org/noetic)
-[![MCU](https://img.shields.io/badge/MCU-ESP32%20%7C%20Arduino%20Due-green)](https://www.espressif.com/)
-[![Platform](https://img.shields.io/badge/Platform-Raspberry%20Pi%204-red)](https://www.raspberrypi.com/)
+[![ROS](https://img.shields.io/badge/ROS-Noetic-blue.svg)](http://wiki.ros.org/noetic)
+[![Python](https://img.shields.io/badge/Python-3.8%2B-yellow.svg)](https://www.python.org/)
+[![MCU](https://img.shields.io/badge/MCU-ESP32%20%7C%20Arduino%20Due-green.svg)](https://www.espressif.com/)
+[![Platform](https://img.shields.io/badge/Platform-Raspberry%20Pi%204-c51a4a.svg)](https://www.raspberrypi.com/)
+[![License](https://img.shields.io/badge/License-MIT-lightgrey.svg)](LICENSE)
 
-This is the software I wrote for our ABU Robocon 2025 team. The theme was **Robot Basketball** — two robots had to move a ball around a court, shoot it into a basket, and block the other team from scoring.
-
-We built two robots with completely different roles, which ended up using pretty different tech stacks too.
+> **ABU Robocon 2025** — India National Round  
+> Dual-robot software stack for competitive Robot Basketball: ROS-based offense and bare-metal defense.
 
 ---
 
-## The Two Robots
+## Abstract
 
-| | R1 — Offense | R2 — Defense |
+This repository presents the complete software and firmware architecture developed for an ABU Robocon 2025 *Robot Basketball* entry. The competition requires two complementary robots: an **offense robot (R1)** that dribbles and shoots, and a **defense robot (R2)** that blocks opposing scores.
+
+**R1** runs ROS Noetic on a Raspberry Pi 4. Five Python nodes implement field-centric teleoperation, dual-stage IMU filtering (median + exponential LPF), active heading-lock PID at 50 Hz, and 4-wheel omnidirectional inverse kinematics. Low-level odometry is offloaded to an ESP32 FreeRTOS task that samples three quadrature encoders at 100 Hz and streams world-frame pose to the Pi over USART. Upper-mechanism actuation (BLDC shooter, stepper aiming, pneumatic dribbler) is coordinated by a dedicated ESP32.
+
+**R2** runs entirely bare-metal on an Arduino Due. An ESP32 forwards PS4 DualShock state via EasyTransfer; the Due executes 3-wheel omni inverse kinematics, proportional heading lock, encoder-gated sliding-net deployment, and pneumatic support in a single deterministic control loop.
+
+Both platforms share the design principle of *shared autonomy*: the driver commands field velocity and a heading target, while onboard IMU feedback continuously corrects rotational drift. This reduces cognitive load under match pressure and improves shot alignment and defensive positioning.
+
+**Keywords:** ABU Robocon, omnidirectional drive, inverse kinematics, ROS Noetic, FreeRTOS, active heading lock, field-centric drive, BNO055, Arduino Due, ESP32
+
+---
+
+## Robots at a Glance
+
+| | **R1 — Offense** | **R2 — Defense** |
 |---|---|---|
-| **Job** | Dribble and shoot the ball | Block the other robot |
-| **Drive** | 4-wheel omni | 3-wheel omni |
-| **Main compute** | Raspberry Pi 4 (ROS Noetic) | Arduino Due (bare-metal) |
-| **Comms** | RPi → ESP32 → Due via USART | ESP32 → Due via USART |
-| **Special mechanisms** | BLDC shooter + pneumatic dribbler | Encoder-controlled sliding net |
-| **Autonomy feature** | Active Heading Lock (IMU + PID) | Active Heading Lock (IMU + PID) |
+| Role | Dribble & shoot | Block opposing robot |
+| Drive | 4-wheel omni (45°) | 3-wheel omni (120°) |
+| Compute | Raspberry Pi 4 — ROS Noetic | Arduino Due — bare-metal |
+| Sensing | BNO055 (I2C) + ESP32 encoder odometry | Gyro angle via EasyTransfer |
+| Actuation | Drive motors, BLDC shooter, stepper aim, pneumatics | Drive motors, sliding net, pneumatics |
+| Shared autonomy | Active heading lock (PI, 50 Hz) | Active heading lock (P control) |
 
 ---
 
 ## System Architecture
 
-### R1 — Offense Robot
+### High-level overview
 
-R1 runs ROS Noetic on a Raspberry Pi 4. All the high-level logic (field-centric drive, heading lock PID, inverse kinematics) lives in Python ROS nodes. The Pi talks to an ESP32 over USART, which handles encoder odometry and streams position data back.
+```mermaid
+flowchart TB
+    subgraph match["Match Field"]
+        PS4["PS4 DualShock 4"]
+    end
 
-```
-  ┌─────────────────────────────────────────────────────────────────────┐
-  │                     Raspberry Pi 4  (ROS Noetic)                    │
-  │                                                                     │
-  │  [PS4 Controller]                                                   │
-  │       │ Bluetooth → joy node → /joy                                 │
-  │       ▼                                                             │
-  │  [joystick_bridge.py] ──► /ps4_data (Twist: vx, vy, heading_target) │
-  │                                   │                                 │
-  │  [imu_pipeline.py]                │                                 │
-  │   BNO055 over I2C                 │                                 │
-  │   quaternion → yaw                │                                 │
-  │   median filter + LPF             │                                 │
-  │       │ /bno055_data (Float32)    │                                 │
-  │       └───────────────────────────▼                                 │
-  │                          [motion_controller.py]   (50 Hz loop)      │
-  │                           ├─ field-centric velocity transform       │
-  │                           ├─ heading lock PID  →  omega             │
-  │                           ├─ 4-wheel omni inverse kinematics        │
-  │                           └──► /motor_value (Int32MultiArray x4)    │
-  │                                         │                           │
-  │  [encoder_bridge.py]                    ▼                           │
-  │   USART ← ESP32               [motor_driver.py]                     │
-  │   /encoder_distance ──────►    ├─ pigpio PWM × 4  (drive motors)    │
-  │   (feeds odometry back         ├─ pneumatic dribbler valves (GPIO)  │
-  │    into motion_controller)     └─ BLDC shooter relay (GPIO)         │
-  │                                         │ pigpio / GPIO             │
-  └─────────────────────────────────────────┼───────────────────────────┘
-                                            │
-           ┌────────────────────────────────┘
-           │
-  ┌──────────────────────────────────────────────────────────┐
-  │  ESP32  (FreeRTOS)                                       │
-  │                                                          │
-  │  Core 0 — Task_EncoderRead  @ 100 Hz                     │
-  │   Reads 3 quadrature encoders (Xu, Xd, Y)                │
-  │   Heading from differential X encoders                   │
-  │   Integrates world-frame X, Y position                   │
-  │   Streams odometry → RPi over USART (EasyTransfer)       │
-  └──────────────────────────────────────────────────────────┘
+    subgraph R1["R1 Offense"]
+        RPi["Raspberry Pi 4<br/>ROS Noetic"]
+        ESP_Odom["ESP32 FreeRTOS<br/>Encoder Odometry"]
+        ESP_Upper["ESP32<br/>Upper Control"]
+        HW1["4× DC Drive · BLDC · Stepper · Pneumatics"]
+        RPi --> ESP_Odom
+        RPi --> ESP_Upper
+        ESP_Odom -->|"USART odometry"| RPi
+        RPi --> HW1
+        ESP_Upper --> HW1
+    end
+
+    subgraph R2["R2 Defense"]
+        ESP_BT["ESP32<br/>PS4 Bluetooth"]
+        Due["Arduino Due<br/>Bare-metal Controller"]
+        HW2["3× DC Drive · Sliding Net · Pneumatics"]
+        ESP_BT -->|"USART EasyTransfer"| Due
+        Due --> HW2
+    end
+
+    PS4 -.->|"Bluetooth"| RPi
+    PS4 -.->|"Bluetooth"| ESP_BT
 ```
 
-### R2 — Defense Robot
+### R1 — ROS dataflow
 
-R2 runs entirely on an Arduino Due — no OS, no ROS. An ESP32 handles PS4 Bluetooth and forwards the controller state over USART. Everything else (IK, heading lock, net control) is one bare-metal loop on the Due.
+```mermaid
+flowchart LR
+    Joy["/joy<br/>PS4"] --> JB["joystick_bridge"]
+    JB --> PS4["/ps4_data<br/>Twist"]
+    IMU["BNO055 I2C"] --> IP["imu_pipeline"]
+    IP --> YAW["/bno055_data<br/>Float32"]
+    ESP["ESP32 USART"] --> EB["encoder_bridge"]
+    EB --> ENC["/encoder_distance"]
 
+    PS4 --> MC["motion_controller<br/>50 Hz"]
+    YAW --> MC
+    ENC --> MC
+
+    MC --> MV["/motor_value"]
+    MC --> ENCO["/encoder"]
+    MV --> MD["motor_driver"]
+    Joy --> MD
+    MD --> Motors["pigpio PWM ×4<br/>+ GPIO actuators"]
 ```
-  ┌───────────────────┐                    ┌────────────────────────────────────┐
-  │      ESP32        │                    │            Arduino Due             │
-  │                   │  USART             │                                    │
-  │  PS4 Bluetooth    │  EasyTransfer      │  3-wheel omni inverse kinematics   │
-  │  receiver         │ ─────────────────► │  Active heading lock (P control)   │
-  │                   │                    │  Encoder-gated net deployment      │
-  │                   │  struct {          │  Pneumatic valve driver            │
-  │                   │   x, y,            │                                    │
-  │                   │   buttons,         │  Motor PWM × 3  +  DIR × 3         │
-  │                   │   angle }          │  Net motor PWM  +  encoder         │
-  └───────────────────┘                    └────────────────────────────────────┘
+
+### R2 — Bare-metal loop
+
+```mermaid
+flowchart LR
+    PS4["PS4 DualShock"] --> ESP["ESP32 BT"]
+    ESP -->|"EasyTransfer<br/>x, y, buttons, angle"| Due["Arduino Due"]
+    Due --> IK["3-wheel IK"]
+    Due --> HL["Heading Lock"]
+    Due --> Net["Encoder-gated Net"]
+    Due --> Pne["Pneumatics"]
+    IK --> M["PWM ×3"]
+    HL --> M
 ```
+
+> Detailed block diagrams, control math, and pin maps: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** · **[docs/CONTROL_SYSTEMS.md](docs/CONTROL_SYSTEMS.md)** · **[docs/HARDWARE.md](docs/HARDWARE.md)**
 
 ---
 
-## Key Features
+## Key Technical Contributions
 
 ### Active Heading Lock
 
-This was probably the most useful thing we built. Both robots are teleoperated, but instead of the driver constantly correcting for drift, the IMU automatically keeps the robot pointing in the right direction while you drive anywhere.
-
-The driver's right stick sets a heading target. A PID loop running at 50 Hz computes how much angular correction (`ω`) to inject into the wheel speeds. The driver only has to think about where to go, not which way the robot is facing.
-
-On R1 the IMU is a BNO055 connected over I2C to the Pi. Raw quaternion output is converted to yaw, run through a 5-sample median filter to kill I2C glitch spikes, then through an exponential low-pass filter (α = 0.1) to smooth it before it enters the PID:
+Teleoperation with automatic rotational correction. The right stick sets a heading target; a 50 Hz PI loop injects corrective ω into wheel speeds so the driver focuses on translation only.
 
 ```
-error  = target_heading − current_yaw     (wrapped to ±180°)
-ω      = Kp·error + Ki·∫error dt         (Kp = 3.0, Ki = 0.05)
+error = wrap(target − yaw) ∈ [−180°, 180°]
+ω     = Kp · error + Ki · ∫ error dt
+        (R1: Kp = 3.0, Ki = 0.05; R2: P-only, Kp = 1.5)
 ```
-
-On R2 the same idea runs on the Due using the gyro angle that arrives in the EasyTransfer struct.
 
 ### Field-Centric Drive (R1)
 
-The driver's left stick always means the same direction on the field regardless of which way R1 is physically pointing. Forward = forward on the field, always.
-
-Before computing wheel speeds we rotate the joystick velocity vector from world frame into the robot's current body frame using the IMU yaw:
+Joystick axes are interpreted in the field frame. Before IK, velocity is rotated into the body frame using filtered IMU yaw:
 
 ```python
 vx_body =  vx_world * cos(yaw) + vy_world * sin(yaw)
 vy_body = -vx_world * sin(yaw) + vy_world * cos(yaw)
 ```
 
-Then `(vx_body, vy_body, ω)` goes into the IK. Makes a huge difference in how easy the robot is to drive under pressure.
-
 ### Inverse Kinematics
 
-**R1 — 4-wheel omni** (wheels mounted at 45° to chassis sides):
+**R1 — 4-wheel omni (45° mounting)**
 
 ```
-K    = 1 / (2√2) ≈ 0.3536
-L_R  = robot_half_diagonal / wheel_radius = 0.09 / 0.075 = 1.2
+K = 1/(2√2) ≈ 0.3536    L_R = 0.09/0.075 = 1.2
 
-ω₁ = K·(−vx + vy) + L_R·ω    ← front-left
-ω₂ = K·(−vx − vy) + L_R·ω    ← front-right
-ω₃ = K·( vx − vy) + L_R·ω    ← rear-left
-ω₄ = K·( vx + vy) + L_R·ω    ← rear-right
+ω₁ = K(−vx + vy) + L_R·ω     # front-left
+ω₂ = K(−vx − vy) + L_R·ω     # front-right
+ω₃ = K( vx − vy) + L_R·ω     # rear-left
+ω₄ = K( vx + vy) + L_R·ω     # rear-right
 ```
 
-**R2 — 3-wheel omni** (120° symmetric layout):
+**R2 — 3-wheel omni (120°)**
 
 ```
-ω₁ = (−2vx / 3)               + (ω / 3)    ← front
-ω₂ = ( vx / 3) + (vy / √3)   + (ω / 3)    ← rear-right
-ω₃ = ( vx / 3) − (vy / √3)   + (ω / 3)    ← rear-left
+ω₁ = (−2vx/3)              + ω/3
+ω₂ = ( vx/3) + (vy/√3)     + ω/3
+ω₃ = ( vx/3) − (vy/√3)     + ω/3
 ```
 
-In both cases the outputs are proportionally scaled so the fastest wheel hits PWM 255 and the others scale down, keeping the velocity direction ratio intact.
+Outputs are proportionally scaled so the fastest wheel saturates at PWM 255 without distorting the velocity ratio.
 
-### FreeRTOS Encoder Odometry (R1 ESP32)
+### FreeRTOS Encoder Odometry (R1)
 
-The ESP32 on R1 runs a FreeRTOS task pinned to Core 0 that reads three quadrature encoders at 100 Hz. It uses the tick difference between the upper and lower X-axis encoders to estimate heading (`Δangle = (ΔxD − ΔxU) × dist_per_pulse / (2 × enc_radius)`), then integrates world-frame X/Y position. The result is streamed to the RPi over USART via EasyTransfer.
+ESP32 Core 0 runs a 100 Hz task reading three quadrature encoders. Differential X-encoders estimate heading; body-frame deltas are integrated into world-frame pose and streamed to the Pi via EasyTransfer.
 
-We used FreeRTOS here mainly to keep the encoder sampling on a dedicated core at a fixed rate — missing encoder pulses means wrong odometry, so it can't be blocked by anything else running on the same core.
+### Sliding Net (R2)
 
-### Sliding Net Mechanism (R2)
-
-R2 has a physical sliding net that deploys to block the ball. It's driven by a DC motor with a quadrature encoder. Instead of using a limit switch we count encoder ticks from the moment the driver presses Triangle and stop the motor after 700 ticks — enough to fully deploy without over-travel. Rising-edge detection (`triangle && !trianglePrevState`) prevents re-triggering on a held button.
-
-### Multi-Actuator Upper Control (R1)
-
-A single ESP32 manages three completely independent actuators on R1's upper mechanism through serial commands:
-
-- **BLDC shooter** via an ESC — PWM at 50 Hz (1000–2000 µs). ESC calibration sequence runs in `setup()` so it's armed before match start. Command: `T <throttle_us>`
-- **Stepper motor** for shooter angle — step pulses with encoder feedback to verify final angle. Gear ratio: 8800 encoder ticks = 23°. Command: `A <degrees>`
-- **Pneumatic dribbler** — 4 solenoid valves in a timed extend → hold → retract sequence. Command: `D`
+DC motor + quadrature encoder deploys the blocking net. Rising-edge on Triangle starts travel; motor stops at 700 ticks — no limit switch required.
 
 ---
 
-## Repo Structure
+## Repository Structure
 
 ```
 robocon-2025/
-├── README.md
+├── README.md                          # This file
+├── LICENSE                            # MIT
+├── CONTRIBUTING.md
+├── CITATION.cff
+├── requirements.txt                   # Python / ROS node dependencies
+├── docs/
+│   ├── ARCHITECTURE.md                # System & ROS graphs
+│   ├── CONTROL_SYSTEMS.md             # PID, IK, filters
+│   └── HARDWARE.md                    # BOM-style hardware map
 │
 ├── r1_offense/
 │   ├── ros_ws/
-│   │   ├── motion_controller.py    # main loop: field-centric + heading PID + 4-wheel IK
-│   │   ├── imu_pipeline.py         # BNO055 I2C → quaternion → yaw → median+LPF → publish
-│   │   ├── motor_driver.py         # /motor_value → pigpio PWM ×4, + pneumatics + BLDC relay
-│   │   ├── joystick_bridge.py      # /joy (Joy) → /ps4_data (Twist)
-│   │   └── encoder_bridge.py       # USART serial → /encoder_distance (Float32MultiArray)
-│   │
+│   │   ├── motion_controller.py       # Field-centric + heading PI + 4-wheel IK
+│   │   ├── imu_pipeline.py            # BNO055 → yaw → median + LPF
+│   │   ├── motor_driver.py            # pigpio PWM + actuator GPIO
+│   │   ├── joystick_bridge.py         # /joy → /ps4_data Twist
+│   │   └── encoder_bridge.py          # USART → /encoder_distance
 │   └── firmware/
-│       ├── esp32_odometry_rtos/
-│       │   └── esp32_odometry_rtos.ino   # FreeRTOS encoder odometry → USART to RPi
-│       └── upper_control/
-│           └── upper_control.ino         # BLDC ESC + stepper angle control + pneumatic dribbler
+│       ├── esp32_odometry_rtos/       # FreeRTOS encoder odometry
+│       └── upper_control/             # BLDC + stepper + pneumatics
 │
 └── r2_defense/
     └── firmware/
-        └── due_omni_controller/
-            └── due_omni_controller.ino   # 3-wheel IK + heading lock + net mechanism + pneumatics
+        └── due_omni_controller/       # Full bare-metal R2 firmware
 ```
 
 ---
 
-## Hardware
+## Getting Started
 
-### R1 — Offense
+### Prerequisites
 
-| Component | Details |
+| Component | Requirement |
 |---|---|
-| Compute | Raspberry Pi 4 (4 GB) |
-| IMU | Bosch BNO055 — I2C, NDOF quaternion fusion mode |
-| Odometry MCU | ESP32 DevKit — FreeRTOS, 3× quadrature encoders |
-| Motor MCU | Arduino Due — receives /motor_value over USART |
-| Drive | 4× brushed DC motors, omni wheels |
-| Shooter | BLDC motor + ESC, 50 Hz PWM (1000–2000 µs) |
-| Aiming | Stepper motor + quadrature encoder (8800 ticks = 23°) |
-| Dribbler | 4-channel pneumatic solenoid valves (2 cylinders) |
-| Controller | PS4 DualShock 4, Bluetooth |
+| R1 compute | Raspberry Pi 4, ROS Noetic, Python 3.8+ |
+| R1 MCU | ESP32 DevKit (Arduino core + FreeRTOS) |
+| R2 MCU | Arduino Due + ESP32 (PS4 bridge) |
+| Controller | PS4 DualShock 4 (Bluetooth) |
 
-### R2 — Defense
+### Python dependencies (R1)
 
-| Component | Details |
-|---|---|
-| MCU | Arduino Due |
-| Wireless MCU | ESP32 DevKit — PS4 Bluetooth → USART EasyTransfer |
-| IMU | ADXRS gyroscope — SPI |
-| Drive | 3× brushed DC motors, omni wheels |
-| Net | DC motor + quadrature encoder (700-tick travel limit) |
-| Pneumatics | 2-valve solenoid (pins 52, 53) |
-| Controller | PS4 DualShock 4, Bluetooth |
+```bash
+pip install -r requirements.txt
+sudo pigpiod   # start pigpio daemon before motor_driver.py
+```
+
+### Launch R1 (six terminals / one launch file of your choice)
+
+```bash
+# Flash esp32_odometry_rtos.ino and upper_control.ino first
+
+rosrun robocon_node imu_pipeline.py
+roslaunch joy joy.launch
+rosrun robocon_node joystick_bridge.py
+rosrun robocon_node encoder_bridge.py
+rosrun robocon_node motor_driver.py
+rosrun robocon_node motion_controller.py
+```
+
+### Launch R2
+
+Flash `r2_defense/firmware/due_omni_controller/due_omni_controller.ino` to the Arduino Due and the companion ESP32 PS4 bridge. No ROS required.
 
 ---
 
 ## Dependencies
 
-### ROS Nodes (Python 3, ROS Noetic)
-```
-rospy  sensor_msgs  geometry_msgs  std_msgs
-pigpio
-adafruit-circuitpython-bno055
-pyserial
-```
+**ROS / Python**
 
-### Arduino / ESP32 Firmware
-```
-EasyTransfer        # structured USART binary protocol
-ESP32Encoder        # quadrature decoding on ESP32
-ESP32Servo          # ESC PWM on ESP32
-AsyncTCP + ESPAsyncWebServer
-ArduinoJson
-PS4Controller
-```
+| Package | Role |
+|---|---|
+| `rospy`, `sensor_msgs`, `geometry_msgs`, `std_msgs` | ROS Noetic messaging |
+| `pigpio` | Hardware PWM & GPIO |
+| `adafruit-circuitpython-bno055` | BNO055 IMU |
+| `pyserial` | USART encoder bridge |
 
----
+**Firmware libraries**
 
-## Running R1
-
-```bash
-# Flash esp32_odometry_rtos.ino to the ESP32 (update WiFi credentials first)
-# Then on the Pi:
-
-rosrun robocon_node imu_pipeline.py       # terminal 1
-roslaunch joy joy.launch                   # terminal 2
-rosrun robocon_node joystick_bridge.py    # terminal 3
-rosrun robocon_node encoder_bridge.py     # terminal 4
-rosrun robocon_node motor_driver.py       # terminal 5
-rosrun robocon_node motion_controller.py  # terminal 6
-```
-
-For R2, just flash `due_omni_controller.ino` to the Due. No other setup needed.
+| Library | Role |
+|---|---|
+| EasyTransfer | Structured USART packets |
+| ESP32Encoder / Encoder | Quadrature decoding |
+| ESP32Servo | ESC PWM (50 Hz) |
+| PS4Controller | DualShock Bluetooth (ESP32) |
 
 ---
 
-## What I Worked On
+## Documentation
 
-- Full **ROS software stack for R1** — all five Python nodes
-- **Active heading lock** — PID design, IMU signal chain, tuning
-- **Field-centric drive** — IMU yaw coordinate transform
-- **4-wheel and 3-wheel omni inverse kinematics** in both Python (ROS) and C++ (bare-metal)
-- **FreeRTOS ESP32 firmware** — encoder odometry on a dedicated core, streamed to RPi over USART
-- **Upper control firmware** — coordinating BLDC, stepper, and pneumatics on one ESP32
-- **USART EasyTransfer communication layer** across all microcontrollers
-- **R2 defense controller** — full bare-metal firmware on Arduino Due including the encoder-gated net mechanism
+| Document | Contents |
+|---|---|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Layered architecture, ROS graph, USART protocols |
+| [docs/CONTROL_SYSTEMS.md](docs/CONTROL_SYSTEMS.md) | Heading lock, filters, IK derivations |
+| [docs/HARDWARE.md](docs/HARDWARE.md) | Compute, sensors, actuators, pinouts |
+
+---
+
+## Author Contributions
+
+- Full **ROS software stack for R1** (five Python nodes)
+- **Active heading lock** — PI design, IMU signal chain, tuning
+- **Field-centric drive** — yaw-based world→body transform
+- **4-wheel and 3-wheel omni IK** in Python (ROS) and C++ (Due)
+- **FreeRTOS ESP32 odometry** — dedicated-core 100 Hz encoder task
+- **Upper-control firmware** — BLDC ESC, closed-loop stepper, pneumatics
+- **USART EasyTransfer** layer across MCUs
+- **R2 defense firmware** — bare-metal Due controller + encoder-gated net
+
+---
+
+## Citation
+
+If you reference this work, please cite:
+
+```bibtex
+@software{robocon2025_basketball,
+  title   = {Robocon 2025 Robot Basketball: Dual-Robot Control Software},
+  year    = {2025},
+  url     = {https://github.com/<your-org>/robocon-2025},
+  note    = {ABU Robocon 2025 — India National Round}
+}
+```
+
+Or use the machine-readable [`CITATION.cff`](CITATION.cff).
+
+---
+
+## License
+
+Released under the [MIT License](LICENSE).
 
 ---
 
